@@ -2,8 +2,6 @@ import rasterio
 import numpy as np
 from os import path
 
-features = rasterio.open('data\\raw\\gems-geodawn-numerical-features.tif')
-
 def load_data(path):
     raster = rasterio.open(path)
     print(type(raster.read(1)))
