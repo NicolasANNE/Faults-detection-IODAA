@@ -12,7 +12,12 @@ from rasterio.transform import Affine
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, Subset
 
-from dataops.pretreatment import create_blocks, create_fold_map, dilate_labels
+from dataops.pretreatment import (
+    create_blocks,
+    create_fold_map,
+    dilate_labels,
+    fit_band_scaler,
+)
 from src.reproducibility import seed_worker
 
 
@@ -104,9 +109,9 @@ class FaultPatchDataset(Dataset[FaultPatchSample]):
     The target marks only original `Y_RAW == 1` pixels; supervision includes
     known original positives and zeros inside the current buffered group.
 
+    Band statistics are fitted on finite pixels from `train_fold_ids` only.
     Non-finite covariates and out-of-raster padding are flagged in
-    `feature_validity`; non-finite covariates are filled with zero in
-    `features`, while out-of-raster input values are replicated from the edge.
+    `feature_validity`; normalized missing values are filled with zero.
     """
 
     def __init__(
@@ -116,6 +121,7 @@ class FaultPatchDataset(Dataset[FaultPatchSample]):
         *,
         transform: Affine | Sequence[float],
         patch_size: int,
+        train_fold_ids: Sequence[int],
         kernel_size: int = 10,
         n_folds: int = 4,
         random_state: int = 0,
@@ -124,11 +130,10 @@ class FaultPatchDataset(Dataset[FaultPatchSample]):
             raise ValueError("patch_size/kernel_size must be positive and n_folds >= 3")
 
         feature_array = _as_numpy(features)
-        self.features = torch.as_tensor(feature_array, dtype=torch.float32)
         self.raw_labels = _as_numpy(raw_labels).astype(np.float32, copy=False)
         if (
-            self.features.ndim != 3
-            or self.raw_labels.shape != tuple(self.features.shape[-2:])
+            feature_array.ndim != 3
+            or self.raw_labels.shape != tuple(feature_array.shape[-2:])
         ):
             raise ValueError(
                 "features must be (channels, height, width) and labels (height, width)"
@@ -160,6 +165,18 @@ class FaultPatchDataset(Dataset[FaultPatchSample]):
             self.n_folds,
             self.random_state,
         )
+        self.train_fold_ids = tuple(train_fold_ids)
+        self.feature_mean, self.feature_scale = fit_band_scaler(
+            feature_array, self.fold_map, self.train_fold_ids
+        )
+        normalized_features = (
+            feature_array - self.feature_mean[:, None, None]
+        ) / self.feature_scale[:, None, None]
+        normalized_features = np.nan_to_num(
+            normalized_features, nan=0.0, posinf=0.0, neginf=0.0
+        ).astype(np.float32, copy=False)
+        self.features = torch.from_numpy(normalized_features)
+        self.feature_validity = torch.from_numpy(np.isfinite(feature_array))
         self.Y_buff = self.buffered_labels
         self.Y_blocks = self.group_ids
         self.fold_map_consensus = self.fold_map
@@ -218,6 +235,9 @@ class FaultPatchDataset(Dataset[FaultPatchSample]):
         feature_patch = self.features[
             :, source_top:source_bottom, source_left:source_right
         ]
+        feature_validity = self.feature_validity[
+            :, source_top:source_bottom, source_left:source_right
+        ]
         padding = (
             source_left - left,
             right - source_right,
@@ -226,6 +246,9 @@ class FaultPatchDataset(Dataset[FaultPatchSample]):
         )
         if any(padding):
             feature_patch = F.pad(feature_patch, padding, mode="replicate")
+            feature_validity = F.pad(
+                feature_validity, padding, mode="constant", value=False
+            )
         spatial_validity = torch.zeros(
             (self.patch_size, self.patch_size), dtype=torch.bool
         )
@@ -235,10 +258,7 @@ class FaultPatchDataset(Dataset[FaultPatchSample]):
             spatial_top : spatial_top + source_bottom - source_top,
             spatial_left : spatial_left + source_right - source_left,
         ] = True
-        feature_validity = torch.isfinite(feature_patch) & spatial_validity.unsqueeze(0)
-        feature_patch = torch.nan_to_num(
-            feature_patch, nan=0.0, posinf=0.0, neginf=0.0
-        )
+        feature_validity &= spatial_validity.unsqueeze(0)
 
         group_patch = _extract_map_patch(
             self.group_ids, top, left, self.patch_size, fill_value=0
@@ -273,6 +293,9 @@ def make_fault_dataloaders(
     seed: int = 0,
 ) -> dict[str, DataLoader]:
     """Build train, validation, and test loaders for one spatial split."""
+    if set(dataset.train_fold_ids) != set(split.train_folds):
+        raise ValueError("Dataset scaler and training loader must use the same folds")
+
     all_folds = (*split.train_folds, split.validation_fold, split.test_fold)
     if (
         len(split.train_folds) != dataset.n_folds - 2

@@ -1,11 +1,17 @@
 seed: 0
 KERNEL_SIZE: 10
-patch_size: 100
+patch_size: 128
+
+folds:
+  train: [2, 3]
+  validation: 0
+  test: 1
 
 dataset:
   _target_: dataops.dataset_torch.FaultPatchDataset
   _recursive_: false
   patch_size: ${patch_size}
+  train_fold_ids: ${folds.train}
   kernel_size: ${KERNEL_SIZE}
   n_folds: 4
   random_state: ${seed}

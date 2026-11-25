@@ -85,3 +85,24 @@ def create_fold_map(
     fold_map = np.full(block_ids.shape, np.nan, dtype=np.float32)
     fold_map[rows, cols] = folds[inverse]
     return fold_map, folds
+
+
+def fit_band_scaler(
+    features: np.ndarray,
+    fold_map: np.ndarray,
+    train_fold_ids: tuple[int, ...],
+) -> tuple[np.ndarray, np.ndarray]:
+    train_pixels = np.isin(fold_map, train_fold_ids)
+    means = np.empty(features.shape[0], dtype=np.float64)
+    scales = np.empty(features.shape[0], dtype=np.float64)
+
+    for band_id, band in enumerate(features):
+        values = band[train_pixels]
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            raise ValueError(f"No finite training pixels for band {band_id}")
+        scaler = StandardScaler().fit(values.reshape(-1, 1))
+        means[band_id] = scaler.mean_[0]
+        scales[band_id] = scaler.scale_[0]
+
+    return means.astype(np.float32), scales.astype(np.float32)
