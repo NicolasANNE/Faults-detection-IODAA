@@ -1,0 +1,31 @@
+defaults:
+  - fault_dataset
+  - _self_
+
+data:
+  features_path: data/raw/gems-geodawn-numerical-features.tif
+  labels_path: data/raw/existing_faults.tif
+
+model:
+  _target_: ???
+
+training:
+  epochs: 30
+  batch_size: 16
+  num_workers: 0
+  device: auto
+  deterministic: false
+  checkpoint_dir: checkpoints
+  save_every: 0
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 0.001
+    weight_decay: 0.0001
+  criterion:
+    _target_: torch.nn.BCEWithLogitsLoss
+    reduction: none
+    pos_weight: null
+
+hydra:
+  job:
+    chdir: false
