@@ -1,0 +1,18 @@
+# @package _global_
+model:
+  hyperparameters:
+    input_channels: 19
+    output_channels: 1
+    base_channels: 32
+    group_norm_groups: 8
+    dropout: 0.2
+    prevalence: 0.0118
+    activation: silu
+  _target_: models.Unet_base
+  in_channels: ${model.hyperparameters.input_channels}
+  out_channels: ${model.hyperparameters.output_channels}
+  base_channels: ${model.hyperparameters.base_channels}
+  group_norm_groups: ${model.hyperparameters.group_norm_groups}
+  dropout: ${model.hyperparameters.dropout}
+  prevalence: ${model.hyperparameters.prevalence}
+  activation: ${model.hyperparameters.activation}
