@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "NicolasANNE", email = "nicolas.anne090@gmail.com" }
 ]
-requires-python = ">=3.14"
+requires-python = ">=3.13,<3.14"
 dependencies = [
     "debugpy==1.8.22",
     "defusedxml==0.7.1",
@@ -68,11 +68,14 @@ dependencies = [
     "six==1.17.0",
     "soupsieve==3.0.4",
     "stack-data==0.6.3",
+    "tensorboard>=2.21.0",
     "threadpoolctl==3.7.0",
     "tifffile==2026.10.15",
     "tinycss2==1.5.1",
     "torch>=2.15.0",
+    "torchvision>=0.29.2",
     "tornado==6.6",
+    "tqdm>=4.70.1",
     "traitlets==5.16.1",
     "typing-extensions==4.16.0",
     "tzdata==2026.6",
@@ -82,3 +85,12 @@ dependencies = [
 
 [tool.uv]
 package = false
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu132" }
+torchvision = { index = "pytorch-cu132" }
