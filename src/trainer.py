@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from inspect import getfile
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,8 @@ import rasterio
 import torch
 from hydra import main as hydra_main
 from hydra.utils import instantiate, to_absolute_path
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
 from omegaconf import DictConfig, OmegaConf
 from rasterio.transform import Affine
 from torch import nn
@@ -23,6 +26,7 @@ from dataops.dataset_torch import (
     make_fault_dataloaders,
 )
 from src.data import load_data
+from src.inference import predict_full_map, save_probability_geotiff
 from src.metrics import DTI
 from src.reproducibility import seed_everything
 
@@ -33,20 +37,46 @@ def masked_loss(
     supervision_mask: torch.Tensor,
     criterion: nn.Module,
 ) -> torch.Tensor:
-    """Reduce an elementwise criterion over known target pixels only."""
-    if logits.shape != target.shape:
-        raise ValueError(
-            f"model output {tuple(logits.shape)} must match target "
-            f"{tuple(target.shape)}"
-        )
-    pixel_losses = criterion(logits, target)
-    if pixel_losses.shape != target.shape:
-        raise ValueError("criterion must return one loss value per target pixel")
-
-    valid = supervision_mask.bool()
-    if not valid.any():
+    """Apply the configured segmentation loss over supervised pixels."""
+    if logits.shape != target.shape or target.shape != supervision_mask.shape:
+        raise ValueError("logits, target, and supervision mask must have one shape")
+    if not supervision_mask.any():
         raise ValueError("batch contains no supervised pixels")
-    return pixel_losses.masked_select(valid).mean()
+    loss = criterion(logits, target, supervision_mask)
+    if loss.ndim != 0:
+        raise ValueError("spatial loss must return a scalar")
+    if not torch.isfinite(loss):
+        raise FloatingPointError("configured loss is not finite")
+    return loss
+
+
+def save_prediction_heatmap(
+    probabilities: np.ndarray,
+    output_path: str | Path,
+) -> Path:
+    """Save a full-raster prediction probability heatmap as a PNG."""
+    if probabilities.ndim != 2 or not np.isfinite(probabilities).all():
+        raise ValueError("probabilities must be a finite two-dimensional map")
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    figure = Figure(figsize=(12, 10), constrained_layout=True)
+    canvas = FigureCanvasAgg(figure)
+    axis = figure.add_subplot(1, 1, 1)
+    image = axis.imshow(
+        probabilities,
+        cmap="inferno",
+        vmin=0.0,
+        vmax=1.0,
+        interpolation="nearest",
+    )
+    figure.colorbar(image, ax=axis, label="Fault probability")
+    axis.set_title("Full-map fault probability")
+    axis.set_xlabel("Column (pixels)")
+    axis.set_ylabel("Row (pixels)")
+    canvas.print_figure(output_path, dpi=180, bbox_inches="tight")
+    figure.clear()
+    return output_path
 
 
 def _stitch_batch(
@@ -59,12 +89,12 @@ def _stitch_batch(
     region_map: np.ndarray,
 ) -> None:
     """Place supervised patch pixels onto their original raster coordinates."""
-    probabilities_array = probabilities.detach().cpu().numpy()[:, 0]
-    targets_array = targets.detach().cpu().numpy()[:, 0]
-    masks_array = supervision_mask.detach().cpu().numpy()[:, 0].astype(bool)
+    probability_patches = probabilities.detach().cpu().numpy()[:, 0]
+    target_patches = targets.detach().cpu().numpy()[:, 0]
+    mask_patches = supervision_mask.detach().cpu().numpy()[:, 0].astype(bool)
     origins = patch_origins.detach().cpu().numpy()
     height, width = region_map.shape
-    patch_height, patch_width = targets_array.shape[-2:]
+    patch_height, patch_width = target_patches.shape[-2:]
 
     for index, (top, left) in enumerate(origins):
         top, left = int(top), int(left)
@@ -79,13 +109,13 @@ def _stitch_batch(
         patch_right = patch_left + raster_right - raster_left
         patch_slice = np.s_[patch_top:patch_bottom, patch_left:patch_right]
         raster_slice = np.s_[raster_top:raster_bottom, raster_left:raster_right]
-        valid = masks_array[index][patch_slice]
+        valid = mask_patches[index][patch_slice]
         region = region_map[raster_slice]
         if np.any(valid & region):
             raise ValueError("supervised patches overlap on the raster")
 
-        probabilities = probabilities_array[index][patch_slice]
-        targets = targets_array[index][patch_slice]
+        probabilities = probability_patches[index][patch_slice]
+        targets = target_patches[index][patch_slice]
         prediction_map[raster_slice][valid] = probabilities[valid]
         target_map[raster_slice][valid] = targets[valid]
         region[valid] = True
@@ -98,14 +128,14 @@ def evaluate(
     criterion: nn.Module,
     device: torch.device,
 ) -> dict[str, float]:
-    """Evaluate masked loss and one global DTI over the supervised raster area."""
+    """Evaluate the loss and global DTI over the supervised raster area."""
     model.eval()
     height, width = dataset.raw_labels.shape
     prediction_map = np.zeros((height, width), dtype=np.float32)
     target_map = np.zeros((height, width), dtype=np.float32)
     region_map = np.zeros((height, width), dtype=bool)
     weighted_loss = 0.0
-    supervised_pixels = 0
+    sample_count = 0
 
     with torch.no_grad():
         for batch in data_loader:
@@ -114,9 +144,9 @@ def evaluate(
             mask = batch["supervision_mask"].to(device)
             logits = model(features)
             loss = masked_loss(logits, targets, mask, criterion)
-            pixel_count = int(mask.sum().item())
-            weighted_loss += float(loss.item()) * pixel_count
-            supervised_pixels += pixel_count
+            count = int(features.shape[0])
+            weighted_loss += float(loss.item()) * count
+            sample_count += count
             _stitch_batch(
                 torch.sigmoid(logits),
                 targets,
@@ -127,10 +157,10 @@ def evaluate(
                 region_map,
             )
 
-    if supervised_pixels == 0:
-        raise ValueError("evaluation split contains no supervised pixels")
+    if sample_count == 0:
+        raise ValueError("evaluation split contains no samples")
     return {
-        "loss": weighted_loss / supervised_pixels,
+        "loss": weighted_loss / sample_count,
         "dti": float(DTI(target_map, region_map)(prediction_map)),
     }
 
@@ -142,10 +172,10 @@ def train_epoch(
     criterion: nn.Module,
     device: torch.device,
 ) -> float:
-    """Train for one epoch and return loss weighted by supervised pixel count."""
+    """Train one epoch, averaging the configured loss by sample count."""
     model.train()
     weighted_loss = 0.0
-    supervised_pixels = 0
+    sample_count = 0
 
     for batch in data_loader:
         features = batch["features"].to(device)
@@ -157,13 +187,13 @@ def train_epoch(
         loss.backward()
         optimizer.step()
 
-        pixel_count = int(mask.sum().item())
-        weighted_loss += float(loss.item()) * pixel_count
-        supervised_pixels += pixel_count
+        count = int(features.shape[0])
+        weighted_loss += float(loss.item()) * count
+        sample_count += count
 
-    if supervised_pixels == 0:
-        raise ValueError("training split contains no supervised pixels")
-    return weighted_loss / supervised_pixels
+    if sample_count == 0:
+        raise ValueError("training split contains no samples")
+    return weighted_loss / sample_count
 
 
 def train(
@@ -235,7 +265,7 @@ def train(
 def _load_rasters(
     features_path: str,
     labels_path: str,
-) -> tuple[np.ndarray, np.ndarray, Affine]:
+) -> tuple[np.ndarray, np.ndarray, Affine, dict[str, Any]]:
     features_path = to_absolute_path(features_path)
     labels_path = to_absolute_path(labels_path)
     features = load_data(features_path)
@@ -251,12 +281,19 @@ def _load_rasters(
         ):
             raise ValueError("feature and label rasters must share a grid")
         transform = feature_source.transform
-    return features, labels, transform
+        profile = feature_source.profile.copy()
+    return features, labels, transform, profile
+
+
+def _instantiate_model(cfg: DictConfig) -> nn.Module:
+    model_config = OmegaConf.to_container(cfg, resolve=True)
+    model_config.pop("hyperparameters")
+    return instantiate(model_config)
 
 
 @hydra_main(version_base="1.3", config_path="../configs", config_name="train")
 def main(cfg: DictConfig) -> dict[str, Any]:
-    """Run one configured experiment and evaluate its selected model on test."""
+    """Run a configured experiment and optionally infer the full raster."""
     seed = int(cfg.seed)
     seed_everything(seed, deterministic=bool(cfg.training.deterministic))
     requested_device = str(cfg.training.device)
@@ -266,7 +303,7 @@ def main(cfg: DictConfig) -> dict[str, Any]:
         else requested_device
     )
 
-    features, labels, transform = _load_rasters(
+    features, labels, transform, raster_profile = _load_rasters(
         str(cfg.data.features_path), str(cfg.data.labels_path)
     )
     dataset = instantiate(
@@ -287,7 +324,7 @@ def main(cfg: DictConfig) -> dict[str, Any]:
         num_workers=int(cfg.training.num_workers),
         seed=seed,
     )
-    model = instantiate(cfg.model).to(device)
+    model = _instantiate_model(cfg.model).to(device)
     optimizer = instantiate(cfg.training.optimizer, params=model.parameters())
     criterion = instantiate(cfg.training.criterion).to(device)
 
@@ -295,6 +332,10 @@ def main(cfg: DictConfig) -> dict[str, Any]:
     mlflow.set_experiment(str(cfg.mlflow.experiment_name))
     with mlflow.start_run(run_name=str(cfg.mlflow.experiment_name)) as run:
         mlflow.log_text(OmegaConf.to_yaml(cfg), "config.yaml")
+        mlflow.log_artifact(
+            str(Path(getfile(type(model))).resolve()),
+            artifact_path="model_source",
+        )
         mlflow.log_params(
             {
                 "seed": seed,
@@ -335,7 +376,38 @@ def main(cfg: DictConfig) -> dict[str, Any]:
                 "test/dti": test_metrics["dti"],
             }
         )
-        return {**result, "test": test_metrics}
+        result["test"] = test_metrics
+
+        if cfg.inference.enabled or cfg.inference.heatmap_enabled:
+            predictions = predict_full_map(
+                model,
+                dataset.features,
+                patch_size=int(dataset.patch_size),
+                device=device,
+                gaussian_sigma_scale=float(cfg.inference.gaussian_sigma_scale),
+            )
+            if cfg.inference.heatmap_enabled:
+                configured_heatmap_path = Path(
+                    to_absolute_path(str(cfg.inference.heatmap_path))
+                )
+                heatmap_path = (
+                    configured_heatmap_path.parent
+                    / run.info.run_id
+                    / configured_heatmap_path.name
+                )
+                save_prediction_heatmap(predictions, heatmap_path)
+                mlflow.log_artifact(str(heatmap_path), artifact_path="figures")
+                result["heatmap_path"] = heatmap_path
+
+            if cfg.inference.enabled:
+                output_path = Path(
+                    to_absolute_path(str(cfg.inference.output_path))
+                )
+                save_probability_geotiff(predictions, raster_profile, output_path)
+                mlflow.log_artifact(str(output_path), artifact_path="predictions")
+                result["prediction_path"] = output_path
+
+        return result
 
 
 if __name__ == "__main__":
