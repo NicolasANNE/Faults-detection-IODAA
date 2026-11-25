@@ -1,0 +1,15 @@
+seed: 0
+KERNEL_SIZE: 10
+patch_size: 100
+
+dataset:
+  _target_: dataops.dataset_torch.FaultPatchDataset
+  _recursive_: false
+  patch_size: ${patch_size}
+  kernel_size: ${KERNEL_SIZE}
+  n_folds: 4
+  random_state: ${seed}
+
+mlflow:
+  tracking_uri: sqlite:///./.mlflow.db
+  experiment_name: fault-patch-dataset
