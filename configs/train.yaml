@@ -1,13 +1,11 @@
 defaults:
   - fault_dataset
+  - model: unet_base
   - _self_
 
 data:
   features_path: data/raw/gems-geodawn-numerical-features.tif
   labels_path: data/raw/existing_faults.tif
-
-model:
-  _target_: ???
 
 training:
   epochs: 30
@@ -22,9 +20,18 @@ training:
     lr: 0.001
     weight_decay: 0.0001
   criterion:
-    _target_: torch.nn.BCEWithLogitsLoss
-    reduction: none
-    pos_weight: null
+    _target_: src.metrics.MaskedBCEWithDTILoss
+    bce_weight: 0.7
+    dti_weight: 0.3
+    alpha: 0.2
+    beta: 0.8
+
+inference:
+  enabled: false
+  output_path: predictions/fault_probability.tif
+  heatmap_enabled: true
+  heatmap_path: artifacts/fault_probability_heatmap.png
+  gaussian_sigma_scale: 0.125
 
 hydra:
   job:
