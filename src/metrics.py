@@ -1,3 +1,5 @@
+import torch
+from torch import nn
 from scipy import ndimage as ndi
 import numpy as np
 
@@ -37,6 +39,117 @@ class DTI:
     def __call__(self, p):
         tp, fp, fn = self.parts(p)
         return tp / (tp + self.alpha * fp + self.beta * fn + 1e-9)
+
+
+class DTILoss(nn.Module):
+    """Differentiable ``1 - DTI`` over supervised pixels in each patch."""
+
+    def __init__(self, alpha: float = ALPHA, beta: float = BETA) -> None:
+        super().__init__()
+        self.alpha, self.beta = alpha, beta
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        target: torch.Tensor,
+        region: torch.Tensor,
+    ) -> torch.Tensor:
+        if logits.shape != target.shape or target.shape != region.shape:
+            raise ValueError("logits, target, and region must have the same shape")
+        if logits.ndim != 4 or logits.shape[1] != 1:
+            raise ValueError("DTILoss expects tensors shaped (B, 1, H, W)")
+
+        probabilities = torch.sigmoid(logits[:, 0])
+        total_tp = logits.new_zeros(())
+        total_fp = logits.new_zeros(())
+        total_fn = logits.new_zeros(())
+        valid_samples = 0
+        radius = R_PX
+        target_array = target.detach().cpu().numpy()[:, 0]
+        region_array = region.detach().cpu().numpy()[:, 0].astype(bool)
+        for index, (probability, labels, valid) in enumerate(
+            zip(probabilities, target[:, 0], region[:, 0].bool())
+        ):
+            if not region_array[index].any():
+                continue
+            valid_samples += 1
+            faults = (labels == 1) & valid
+            fault_rows, fault_cols = torch.nonzero(faults, as_tuple=True)
+            n_fault = fault_rows.numel()
+            probability = torch.where(valid, probability, 0)
+            fault_map = (target_array[index] == 1) & region_array[index]
+            distances = ndi.distance_transform_edt(~fault_map).astype(np.float32)
+            fp_weights = 1 - np.clip(1 - distances / radius, 0, None)
+            fp_weights = torch.as_tensor(
+                fp_weights, dtype=probability.dtype, device=probability.device
+            )
+            padded = torch.nn.functional.pad(
+                probability, (radius, radius, radius, radius)
+            )
+            tp = probability.new_zeros(n_fault)
+            for dy, dx, kernel_weight in OFFSETS:
+                contribution = padded[
+                    fault_rows + radius + dy, fault_cols + radius + dx
+                ] * kernel_weight
+                tp = torch.maximum(tp, contribution)
+
+            tp_sum = tp.sum()
+            fp_sum = (probability * fp_weights).sum()
+            fn_sum = n_fault - tp_sum
+            total_tp = total_tp + tp_sum
+            total_fp = total_fp + fp_sum
+            total_fn = total_fn + fn_sum
+
+        if valid_samples == 0:
+            raise ValueError("batch contains no supervised pixels")
+        dti = total_tp / (
+            total_tp + self.alpha * total_fp + self.beta * total_fn + 1e-9
+        )
+        return 1 - dti
+
+
+class MaskedBCEWithDTILoss(nn.Module):
+    """Combine supervised-pixel BCE with an optional differentiable DTI loss."""
+
+    def __init__(
+        self,
+        bce_weight: float = 0.7,
+        dti_weight: float = 0.3,
+        alpha: float = ALPHA,
+        beta: float = BETA,
+    ) -> None:
+        super().__init__()
+        if (
+            not np.isfinite(bce_weight)
+            or not np.isfinite(dti_weight)
+            or bce_weight < 0
+            or dti_weight < 0
+            or bce_weight + dti_weight == 0
+        ):
+            raise ValueError("loss weights must be non-negative with a positive sum")
+        self.bce_weight = bce_weight
+        self.dti_weight = dti_weight
+        self.bce = nn.BCEWithLogitsLoss()
+        self.dti = DTILoss(alpha=alpha, beta=beta)
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        target: torch.Tensor,
+        region: torch.Tensor,
+    ) -> torch.Tensor:
+        if logits.shape != target.shape or target.shape != region.shape:
+            raise ValueError("logits, target, and region must have the same shape")
+        valid = region.bool()
+        if not valid.any():
+            raise ValueError("batch contains no supervised pixels")
+
+        bce = self.bce(logits[valid], target[valid])
+        if self.dti_weight == 0:
+            return self.bce_weight * bce
+        dti = self.dti(logits, target, valid)
+        return self.bce_weight * bce + self.dti_weight * dti
+
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
