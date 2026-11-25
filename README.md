@@ -11,14 +11,16 @@ tests nécessaires pour refaire les expériences.
   référence et résultats du projet.
 - `configs/fault_dataset.yaml` : paramètres Hydra du Dataset, du seed et du
   tracking MLflow local.
+- `configs/model/` : hyperparamètres des architectures Hydra.
 - `dataops/pretreatment.py` : dilatation des labels, création des blocs et
   répartition spatiale en folds.
 - `dataops/dataset_torch.py` : création du Dataset de patches et des
   DataLoaders PyTorch.
-- `src/` : chargement raster, métrique DTI, visualisations et seeds.
+- `models/` : architectures PyTorch, dont `Unet_base`.
+- `src/` : entraînement, inférence raster, métrique DTI, visualisations et seeds.
 - `src/data.py` et `src/metrics.py` : chargement raster et métrique DTI utilisés
   par le notebook.
-- `tests/` : tests unitaires du Dataset, des splits et des seeds.
+- `tests/` : tests unitaires du Dataset, des splits, des modèles et de l'inférence.
 - `data/raw/` : données sources GeoDAWN, à fournir localement.
 - `data/processed/` : caches et résultats dérivés; ils ne sont pas nécessaires
   au dépôt et ne doivent pas être versionnés.
@@ -50,11 +52,10 @@ Python, NumPy et PyTorch. La reproductibilité numérique exacte peut néanmoins
 varier selon le matériel et les versions des bibliothèques, en particulier sur
 GPU.
 
-**Périmètre actuel :** le dépôt fournit la préparation du Dataset de patches,
-les splits spatiaux et les visualisations PyTorch, mais pas encore de boucle
-d'entraînement ou d'évaluation CNN. Le notebook existant documente les
-expériences de modèles classiques; le socle CNN doit être ajouté avant de
-prétendre reproduire un entraînement CNN complet.
+**Périmètre actuel :** le dépôt fournit la préparation reproductible du Dataset,
+les splits spatiaux, l'entraînement CNN configurable, la sélection par DTI et
+l'inférence raster géoréférencée. Le notebook existant documente aussi les
+expériences de modèles classiques.
 
 MLflow est configuré pour un suivi local dans `.mlflow.db`; cette base et les
 artefacts générés restent locaux.
@@ -68,8 +69,8 @@ faille connecté, ainsi que des splits spatiaux train/validation/test. Le
 notebook utilise Hydra via `configs/fault_dataset.yaml`; `KERNEL_SIZE` règle
 la dilatation des failles et `seed` contrôle le clustering et les mélanges des
 DataLoaders. Les arguments fixes du Dataset, dont `_target_`, sont dans la
-section `dataset`. MLflow est réservé au futur entraînement: la
-création/visualisation du Dataset ne démarre aucun run et n'est pas enregistrée.
+section `dataset`. La création/visualisation du Dataset ne démarre aucun run
+MLflow; le suivi des expériences est effectué par `src.trainer`.
 
 ```python
 from pathlib import Path
@@ -143,3 +144,49 @@ la carte des folds; `stride` contrôle la décimation de l'affichage.
 La section `mlflow` du YAML réserve le tracking local sur SQLite (`.mlflow.db`)
 à l'étape d'entraînement. Les runs et métriques MLflow seront créés autour de
 l'entraînement, pas lors de la préparation des données.
+
+## Entraîner un modèle de segmentation
+
+`src.trainer` lance une expérience configurée dans `configs/train.yaml`. Les
+architectures sont choisies par le groupe Hydra `configs/model/`; le modèle
+par défaut `Unet_base` reçoit `(B, 19, patch_size, patch_size)` et retourne des
+logits de forme `(B, 1, patch_size, patch_size)`. Les masques de validité ne
+sont pas des entrées du réseau.
+
+La loss d'entraînement par défaut est l'hybride
+`0.7 * BCE masquée + 0.3 * (1 - sDTI)` (`MaskedBCEWithDTILoss` dans
+`src/metrics.py`). La BCE ne considère que les pixels de `supervision_mask`;
+les poids `training.criterion.bce_weight` et `training.criterion.dti_weight`
+sont surchargeables via Hydra. Pour utiliser uniquement la BCE, mettre le
+poids DTI à `0` et le poids BCE à `1`. Le DTI global exact de validation/test
+reste calculé sur la carte reconstruite et les pixels supervisés; il sélectionne
+le meilleur checkpoint et mesure le test.
+
+Le checkpoint retenu maximise le DTI sur la carte de validation reconstruite
+depuis les origines de patches. Le test n'est évalué qu'une fois, après
+restauration du meilleur checkpoint. Les paramètres et checkpoints sont suivis
+dans MLflow local; les poids sont également enregistrés sous
+`checkpoints/<mlflow-run-id>/`.
+
+```powershell
+uv run python -m src.trainer `
+  model.hyperparameters.dropout=0.15 `
+  model.hyperparameters.base_channels=32 `
+  training.epochs=50 training.batch_size=16 `
+  training.optimizer.lr=0.0005
+```
+
+Chaque fichier `configs/model/<nom>.yaml` expose les hyperparamètres sous
+`model.hyperparameters` et pointe vers une classe telle que
+`models.Unet_base`. Les overrides `model=<nom>`,
+`model.hyperparameters.*`, `data.*`, `dataset.*`, `training.*`, `folds.*` et
+`mlflow.*` permettent de comparer les expériences. Chaque run conserve sa
+configuration effective comme artefact `config.yaml`.
+
+Après l'entraînement, une heatmap de probabilité de la carte complète est
+générée par défaut et journalisée comme artefact MLflow sous `figures/`.
+Désactiver avec `inference.heatmap_enabled=false`. L'export GeoTIFF reste
+optionnel avec `inference.enabled=true` et produit
+`predictions/fault_probability.tif` : fenêtres `patch_size`, pas
+`patch_size // 2`, pondération gaussienne centrée et géoréférencement conservé
+depuis le raster source.
