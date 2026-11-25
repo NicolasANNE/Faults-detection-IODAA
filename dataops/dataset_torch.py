@@ -26,6 +26,7 @@ class FaultPatchSample(TypedDict):
     feature_validity: torch.Tensor
     target: torch.Tensor
     supervision_mask: torch.Tensor
+    patch_origin: torch.Tensor
     group_id: int
     fold_id: int
 
@@ -279,6 +280,7 @@ class FaultPatchDataset(Dataset[FaultPatchSample]):
                 target.astype(np.float32, copy=False)
             ).unsqueeze(0),
             "supervision_mask": torch.from_numpy(supervision_mask).unsqueeze(0),
+            "patch_origin": torch.tensor((top, left), dtype=torch.int64),
             "group_id": group.group_id,
             "fold_id": group.fold_id,
         }
