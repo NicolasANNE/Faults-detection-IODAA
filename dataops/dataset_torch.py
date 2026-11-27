@@ -126,6 +126,7 @@ class FaultPatchDataset(Dataset[FaultPatchSample]):
         kernel_size: int = 10,
         n_folds: int = 4,
         random_state: int = 0,
+        scaler_excluded_region_mask: np.ndarray | None = None,
     ) -> None:
         if patch_size <= 0 or kernel_size <= 0 or n_folds < 3:
             raise ValueError("patch_size/kernel_size must be positive and n_folds >= 3")
@@ -168,7 +169,10 @@ class FaultPatchDataset(Dataset[FaultPatchSample]):
         )
         self.train_fold_ids = tuple(train_fold_ids)
         self.feature_mean, self.feature_scale = fit_band_scaler(
-            feature_array, self.fold_map, self.train_fold_ids
+            feature_array,
+            self.fold_map,
+            self.train_fold_ids,
+            excluded_region_mask=scaler_excluded_region_mask,
         )
         normalized_features = (
             feature_array - self.feature_mean[:, None, None]
@@ -219,6 +223,49 @@ class FaultPatchDataset(Dataset[FaultPatchSample]):
             for index, group in enumerate(self._groups)
             if group.fold_id in selected
         ]
+
+    def indices_outside_region(self, region_mask: np.ndarray) -> list[int]:
+        """Return groups whose labels and input patches do not touch a region."""
+        if region_mask.shape != self.raw_labels.shape:
+            raise ValueError("region_mask must match raster shape")
+
+        region_group_ids = set(
+            np.unique(
+                self.group_ids[region_mask & np.isfinite(self.group_ids)]
+            ).astype(np.int64)
+        )
+        integral = np.pad(
+            region_mask.astype(np.int32)
+            .cumsum(axis=0, dtype=np.int32)
+            .cumsum(axis=1, dtype=np.int32),
+            ((1, 0), (1, 0)),
+        )
+
+        def rectangle_contains_region(top: int, left: int) -> bool:
+            bottom = top + self.patch_size
+            right = left + self.patch_size
+            height, width = region_mask.shape
+            top_clip, left_clip = max(top, 0), max(left, 0)
+            bottom_clip, right_clip = min(bottom, height), min(right, width)
+            if top_clip >= bottom_clip or left_clip >= right_clip:
+                return False
+            count = (
+                integral[bottom_clip, right_clip]
+                - integral[top_clip, right_clip]
+                - integral[bottom_clip, left_clip]
+                + integral[top_clip, left_clip]
+            )
+            return bool(count)
+
+        eligible = []
+        for index, group in enumerate(self._groups):
+            if group.group_id in region_group_ids:
+                continue
+            top = group.center_row - self.patch_size // 2
+            left = group.center_col - self.patch_size // 2
+            if not rectangle_contains_region(top, left):
+                eligible.append(index)
+        return eligible
 
     def __getitem__(self, index: int) -> FaultPatchSample:
         group = self._groups[index]
@@ -293,8 +340,10 @@ def make_fault_dataloaders(
     batch_size: int,
     num_workers: int = 0,
     seed: int = 0,
+    excluded_region_mask: np.ndarray | None = None,
+    include_test: bool = True,
 ) -> dict[str, DataLoader]:
-    """Build train, validation, and test loaders for one spatial split."""
+    """Build fold-role loaders, optionally withholding test from the caller."""
     if set(dataset.train_fold_ids) != set(split.train_folds):
         raise ValueError("Dataset scaler and training loader must use the same folds")
 
@@ -308,11 +357,23 @@ def make_fault_dataloaders(
     fold_sets = {
         "train": split.train_folds,
         "validation": (split.validation_fold,),
-        "test": (split.test_fold,),
     }
+    if include_test:
+        fold_sets["test"] = (split.test_fold,)
+    eligible_indices = (
+        set(dataset.indices_outside_region(excluded_region_mask))
+        if excluded_region_mask is not None
+        else None
+    )
     loaders: dict[str, DataLoader] = {}
     for offset, (name, folds) in enumerate(fold_sets.items()):
         indices = dataset.indices_for_folds(folds)
+        if eligible_indices is not None and name in ("train", "validation"):
+            indices = [index for index in indices if index in eligible_indices]
+            if not indices:
+                raise ValueError(
+                    f"spatial holdout exclusion removed all {name} samples"
+                )
         generator = torch.Generator().manual_seed(seed + offset)
         loaders[name] = DataLoader(
             Subset(dataset, indices),
@@ -323,3 +384,57 @@ def make_fault_dataloaders(
             generator=generator,
         )
     return loaders
+
+
+def make_final_dataloaders(
+    dataset: FaultPatchDataset,
+    *,
+    train_folds: Sequence[int],
+    test_fold: int,
+    batch_size: int,
+    num_workers: int = 0,
+    seed: int = 0,
+    excluded_region_mask: np.ndarray | None = None,
+) -> dict[str, DataLoader]:
+    """Build final train+validation and test loaders after model selection."""
+    selected_train_folds = tuple(train_folds)
+    if set(dataset.train_fold_ids) != set(selected_train_folds):
+        raise ValueError("Dataset scaler and final training loader must use the same folds")
+    if (
+        test_fold in selected_train_folds
+        or set(selected_train_folds) | {test_fold} != set(range(dataset.n_folds))
+    ):
+        raise ValueError("final train and test folds must partition all folds")
+
+    train_indices = dataset.indices_for_folds(selected_train_folds)
+    if excluded_region_mask is not None:
+        eligible_indices = set(dataset.indices_outside_region(excluded_region_mask))
+        train_indices = [
+            index for index in train_indices if index in eligible_indices
+        ]
+    test_indices = dataset.indices_for_folds((test_fold,))
+    if not train_indices:
+        raise ValueError("final spatial exclusion removed all training samples")
+    if not test_indices:
+        raise ValueError("final test fold contains no samples")
+
+    train_generator = torch.Generator().manual_seed(seed)
+    test_generator = torch.Generator().manual_seed(seed + 1)
+    return {
+        "train": DataLoader(
+            Subset(dataset, train_indices),
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            worker_init_fn=seed_worker,
+            generator=train_generator,
+        ),
+        "test": DataLoader(
+            Subset(dataset, test_indices),
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            worker_init_fn=seed_worker,
+            generator=test_generator,
+        ),
+    }
