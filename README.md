@@ -57,7 +57,7 @@ les splits spatiaux, l'entraînement CNN configurable, la sélection par DTI et
 l'inférence raster géoréférencée. Le notebook existant documente aussi les
 expériences de modèles classiques.
 
-MLflow est configuré pour un suivi local dans `.mlflow.db`; cette base et les
+MLflow est configuré pour un suivi local dans `mlflow.db`; cette base et les
 artefacts générés restent locaux.
 
 ---
@@ -141,9 +141,10 @@ puis le masque de cible, les zéros fiables, le masque supervisé et la fraction
 de covariables valides. `plot_fault_overview` situe le groupe sélectionné sur
 la carte des folds; `stride` contrôle la décimation de l'affichage.
 
-La section `mlflow` du YAML réserve le tracking local sur SQLite (`.mlflow.db`)
+La section `mlflow` du YAML réserve le tracking local sur SQLite (`mlflow.db`)
 à l'étape d'entraînement. Les runs et métriques MLflow seront créés autour de
-l'entraînement, pas lors de la préparation des données.
+l'entraînement, pas lors de la préparation des données. Depuis la racine du
+workspace, `mlflow ui` ouvre directement ce même store.
 
 ## Entraîner un modèle de segmentation
 
@@ -157,8 +158,9 @@ La loss d'entraînement par défaut est l'hybride
 `0.7 * BCE masquée + 0.3 * (1 - sDTI)` (`MaskedBCEWithDTILoss` dans
 `src/metrics.py`). La BCE ne considère que les pixels de `supervision_mask`;
 les poids `training.criterion.bce_weight` et `training.criterion.dti_weight`
-sont surchargeables via Hydra. Pour utiliser uniquement la BCE, mettre le
-poids DTI à `0` et le poids BCE à `1`. Le DTI global exact de validation/test
+sont surchargeables via Hydra; si `dti_weight` n'est pas précisé, il vaut
+`1 - bce_weight`, ce qui permet de balayer le poids BCE seul. Pour utiliser
+uniquement la BCE, mettre le poids BCE à `1`. Le DTI global exact de validation/test
 reste calculé sur la carte reconstruite et les pixels supervisés; il sélectionne
 le meilleur checkpoint et mesure le test.
 
@@ -167,6 +169,79 @@ depuis les origines de patches. Le test n'est évalué qu'une fois, après
 restauration du meilleur checkpoint. Les paramètres et checkpoints sont suivis
 dans MLflow local; les poids sont également enregistrés sous
 `checkpoints/<mlflow-run-id>/`.
+
+### DTI sur l'étendue USGS
+
+En plus des métriques historiques calculées sur les pixels supervisés des
+patches, les runs calculent deux DTI sur les probabilités prédites sur toute la
+carte (`predict_full_map`):
+
+- `evaluation/spatial_holdout_dti` est le score principal. La région est une
+  tuile géographique déterministe, définie par
+  `evaluation.spatial_holdout.grid_rows`, `grid_columns` et `region_index`
+  (indexation ligne par ligne depuis le coin supérieur gauche). Les groupes
+  dont les labels ou les patches chevauchent cette tuile sont retirés des
+  ensembles train et validation; le scaler n'utilise pas non plus les pixels
+  de la tuile. Le DTI compte tous les pixels valides de la tuile, pas seulement
+  les patches autour des failles.
+- `evaluation/usgs_full_map_dti` mesure l'accord avec toute la carte
+  `existing_faults.tif`. C'est un diagnostic descriptif, pas une estimation
+  indépendante de généralisation, car des labels de cette carte sont utilisés
+  pendant l'entraînement.
+
+Les deux scores utilisent les pixels où le template de soumission est valide
+et `existing_faults.tif` est fini. Les zéros valides sont comptés comme absence
+de faille cartographiée par l'USGS; ils ne garantissent pas une absence
+géologique réelle. Les valeurs NoData sont ignorées. Les comptes de pixels
+évalués sont également journalisés dans MLflow. Le holdout par défaut est la
+tuile supérieure gauche d'une grille 2×2; changer `region_index` pour évaluer
+une autre tuile. Si elle ne contient aucune faille USGS, le run s'arrête avec
+une erreur explicite plutôt que de produire un score trompeur.
+L'exclusion peut aussi laisser trop peu de patches train ou validation; dans
+ce cas, choisir une autre tuile (`evaluation.spatial_holdout.region_index`) ou
+une grille plus fine (`grid_rows` / `grid_columns`).
+
+Ces métriques ne reproduisent pas le DTI du leaderboard : celui-ci utilise des
+labels experts privés de failles nouvelles, tandis que ces scores mesurent
+l'accord avec l'inventaire USGS actuellement disponible.
+
+## Recherche d'hyperparamètres avec Optuna
+
+Lancer la recherche depuis la racine du dépôt :
+
+```powershell
+uv run python -m src.optuna_tuning
+```
+
+Le study Optuna persistant (`optuna_studies.db`) maximise `validation/dti` sur
+le split courant, avec 50 essais au maximum. Il explore les paramètres de
+`Unet_base` (`base_channels`, `dropout`, `activation`) et d'entraînement
+(`learning rate`, `weight_decay`, `batch_size`, `bce_weight`). `dti_weight`
+reste dérivé de `1 - bce_weight`. Chaque essai s'arrête après 10 époques sans
+amélioration du DTI de validation, avec un plafond de sécurité de 300 époques.
+Le checkpoint au meilleur DTI validation est conservé.
+
+Les essais n'évaluent pas le fold test ni le DTI holdout. Après sélection, le
+meilleur réglage est réentraîné depuis zéro sur les folds train et validation,
+pendant le nombre d'époques du meilleur checkpoint Optuna. Le fold test est
+alors évalué une seule fois; le DTI du holdout spatial est calculé ensuite,
+comme résultat final. Le scaler du refit utilise train+validation et exclut
+toujours la région holdout. Les scores de validation ont servi à optimiser
+plusieurs essais et ne sont donc pas une estimation indépendante. Aucun
+réglage supplémentaire ne doit être fait à partir des scores test ou holdout.
+
+Limite du découpage actuel : l'affectation consensus des folds est construite
+sur les groupes de toute la carte et utilise aussi leur moyenne de labels
+bruts. Les groupes qui touchent le holdout et leurs patches sont exclus du
+train/validation, mais les labels de cette zone participent encore à la
+construction de la carte des folds. Le DTI holdout n'est jamais utilisé par
+Optuna; ce protocole n'est toutefois pas entièrement aveugle aux labels du
+holdout lors de la seule construction des partitions.
+
+Les métriques par époque des essais sont suivies dans MLflow; l'étude est
+stockée séparément de MLflow pour permettre de reprendre les essais. Une fois
+le protocole entré en évaluation finale, une nouvelle exécution avec le même
+nom d'étude est refusée pour éviter de répéter les scores test/holdout.
 
 ```powershell
 uv run python -m src.trainer `
@@ -180,13 +255,28 @@ Chaque fichier `configs/model/<nom>.yaml` expose les hyperparamètres sous
 `model.hyperparameters` et pointe vers une classe telle que
 `models.Unet_base`. Les overrides `model=<nom>`,
 `model.hyperparameters.*`, `data.*`, `dataset.*`, `training.*`, `folds.*` et
-`mlflow.*` permettent de comparer les expériences. Chaque run conserve sa
-configuration effective comme artefact `config.yaml`.
+`evaluation.*`, `mlflow.*` permettent de comparer les expériences. Chaque run
+conserve sa configuration effective comme artefact `config.yaml`. Le nom de
+l'expérience reste stable; chaque run reçoit un nom aléatoire lisible du type
+`monkey-banana-6432823`.
+
+Les entrées natives MLflow utilisent le nom de dataset
+`Fault_KS<KERNEL_SIZE>_Patched` et le nom de modèle issu de la classe (par
+exemple `Unet_base`). Le dataset référence les rasters source et sa
+configuration sans téléverser une deuxième copie des tableaux. Le modèle
+enregistré correspond au meilleur checkpoint de validation.
+
+L'artefact `figures/training_curves.png` compare les losses train/validation
+et le DTI de validation par epoch. D'autres figures utiles à ajouter ensuite
+seraient une superposition prédiction/vérité terrain sur le test ou une carte
+des folds spatiaux.
 
 Après l'entraînement, une heatmap de probabilité de la carte complète est
 générée par défaut et journalisée comme artefact MLflow sous `figures/`.
-Désactiver avec `inference.heatmap_enabled=false`. L'export GeoTIFF reste
-optionnel avec `inference.enabled=true` et produit
-`predictions/fault_probability.tif` : fenêtres `patch_size`, pas
-`patch_size // 2`, pondération gaussienne centrée et géoréférencement conservé
-depuis le raster source.
+Désactiver avec `inference.heatmap_enabled=false`. Le GeoTIFF de soumission est
+également généré par défaut et journalisé sous `predictions/`. Il reprend la
+grille du raster source et le masque NoData du template
+`data/raw/example_submission.tif` : EPSG:32611, résolution 100 m, une bande
+`float32`, probabilités dans `[0, 1]` et NoData `NaN`. Les fichiers locaux sont
+isolés par run sous `predictions/<run-id>/`. L'export utilise des fenêtres
+`patch_size`, un pas `patch_size // 2` et une pondération gaussienne centrée.
