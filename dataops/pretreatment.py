@@ -34,6 +34,36 @@ def create_blocks(buffered_labels: np.ndarray) -> tuple[np.ndarray, int]:
     return block_ids, count
 
 
+def create_spatial_holdout_mask(
+    shape: tuple[int, int],
+    grid_rows: int,
+    grid_columns: int,
+    region_index: int,
+) -> np.ndarray:
+    """Create one deterministic, row-major geographic holdout tile."""
+    if (
+        len(shape) != 2
+        or min(shape) < 1
+        or grid_rows < 1
+        or grid_columns < 1
+        or grid_rows > shape[0]
+        or grid_columns > shape[1]
+    ):
+        raise ValueError("holdout grid must fit within a non-empty 2D raster")
+    if not 0 <= region_index < grid_rows * grid_columns:
+        raise ValueError("region_index must identify a tile in the holdout grid")
+
+    row_index, column_index = divmod(region_index, grid_columns)
+    row_edges = np.linspace(0, shape[0], grid_rows + 1, dtype=int)
+    column_edges = np.linspace(0, shape[1], grid_columns + 1, dtype=int)
+    mask = np.zeros(shape, dtype=bool)
+    mask[
+        row_edges[row_index] : row_edges[row_index + 1],
+        column_edges[column_index] : column_edges[column_index + 1],
+    ] = True
+    return mask
+
+
 def create_fold_map(
     features: np.ndarray,
     raw_labels: np.ndarray,
@@ -91,8 +121,13 @@ def fit_band_scaler(
     features: np.ndarray,
     fold_map: np.ndarray,
     train_fold_ids: tuple[int, ...],
+    excluded_region_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     train_pixels = np.isin(fold_map, train_fold_ids)
+    if excluded_region_mask is not None:
+        if excluded_region_mask.shape != fold_map.shape:
+            raise ValueError("excluded_region_mask must match fold_map shape")
+        train_pixels &= ~excluded_region_mask
     means = np.empty(features.shape[0], dtype=np.float64)
     scales = np.empty(features.shape[0], dtype=np.float64)
 
