@@ -114,11 +114,13 @@ class MaskedBCEWithDTILoss(nn.Module):
     def __init__(
         self,
         bce_weight: float = 0.7,
-        dti_weight: float = 0.3,
+        dti_weight: float | None = None,
         alpha: float = ALPHA,
         beta: float = BETA,
     ) -> None:
         super().__init__()
+        if dti_weight is None:
+            dti_weight = 1.0 - bce_weight
         if (
             not np.isfinite(bce_weight)
             or not np.isfinite(dti_weight)
