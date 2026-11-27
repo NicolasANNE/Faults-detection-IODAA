@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import secrets
 from collections.abc import Iterable
 from inspect import getfile
 from pathlib import Path
+import sys
+ROOT_DIR = Path(__file__).parent.parent.resolve()
+if str(ROOT_DIR) not in sys.path:
+    sys.path.append(str(ROOT_DIR))
+
 from typing import Any
 
 import mlflow
@@ -13,22 +21,34 @@ import rasterio
 import torch
 from hydra import main as hydra_main
 from hydra.utils import instantiate, to_absolute_path
+from mlflow.data import from_numpy
+from mlflow.data.sources import LocalArtifactDatasetSource
+from mlflow.models import ModelSignature
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from omegaconf import DictConfig, OmegaConf
 from rasterio.transform import Affine
 from torch import nn
 from torch.optim import Optimizer
+from mlflow.types import Schema, TensorSpec
 
 from dataops.dataset_torch import (
     FaultPatchDataset,
     SpatialFoldSplit,
     make_fault_dataloaders,
 )
+from dataops.pretreatment import create_spatial_holdout_mask
 from src.data import load_data
-from src.inference import predict_full_map, save_probability_geotiff
+from src.inference import (
+    load_submission_mask,
+    predict_full_map,
+    save_probability_geotiff,
+)
 from src.metrics import DTI
 from src.reproducibility import seed_everything
+
+_RUN_ANIMALS = ("badger", "fox", "lemur", "monkey", "otter", "panda", "tiger")
+_RUN_FRUITS = ("apple", "banana", "kiwi", "mango", "peach", "pear", "plum")
 
 
 def masked_loss(
@@ -48,6 +68,90 @@ def masked_loss(
     if not torch.isfinite(loss):
         raise FloatingPointError("configured loss is not finite")
     return loss
+
+
+def _random_run_name() -> str:
+    animal = secrets.choice(_RUN_ANIMALS)
+    fruit = secrets.choice(_RUN_FRUITS)
+    suffix = secrets.randbelow(10_000_000)
+    return f"{animal}-{fruit}-{suffix:07d}"
+
+
+def _make_mlflow_dataset(
+    dataset: FaultPatchDataset,
+    cfg: DictConfig,
+) -> Any:
+    feature_path = Path(to_absolute_path(str(cfg.data.features_path))).resolve()
+    label_path = Path(to_absolute_path(str(cfg.data.labels_path))).resolve()
+    source_metadata = {
+        "features": (
+            str(feature_path),
+            feature_path.stat().st_size,
+            feature_path.stat().st_mtime_ns,
+        ),
+        "labels": (
+            str(label_path),
+            label_path.stat().st_size,
+            label_path.stat().st_mtime_ns,
+        ),
+        "kernel_size": int(cfg.dataset.kernel_size),
+        "patch_size": int(cfg.dataset.patch_size),
+        "train_folds": list(cfg.folds.train),
+        "validation_fold": int(cfg.folds.validation),
+        "test_fold": int(cfg.folds.test),
+        "spatial_holdout": {
+            "enabled": bool(cfg.evaluation.spatial_holdout.enabled),
+            "grid_rows": int(cfg.evaluation.spatial_holdout.grid_rows),
+            "grid_columns": int(cfg.evaluation.spatial_holdout.grid_columns),
+            "region_index": int(cfg.evaluation.spatial_holdout.region_index),
+        },
+    }
+    digest = hashlib.sha256(
+        json.dumps(source_metadata, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:8]
+    return from_numpy(
+        features=dataset.features.detach().cpu().numpy(),
+        targets=dataset.raw_labels,
+        source=LocalArtifactDatasetSource(uri=feature_path.as_uri()),
+        name=f"Fault_KS{int(cfg.dataset.kernel_size)}_Patched",
+        digest=digest,
+    )
+
+
+def save_training_curves(
+    history: dict[str, list[int | float]],
+    output_path: str | Path,
+) -> Path:
+    """Save train/validation losses and validation DTI by epoch."""
+    epochs = history["epoch"]
+    if not epochs:
+        raise ValueError("training history must contain at least one epoch")
+    if any(len(history[key]) != len(epochs) for key in (
+        "train/loss",
+        "validation/loss",
+        "validation/dti",
+    )):
+        raise ValueError("training metrics must have one value per epoch")
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure = Figure(figsize=(12, 5), constrained_layout=True)
+    canvas = FigureCanvasAgg(figure)
+    loss_axis, dti_axis = figure.subplots(1, 2)
+    loss_axis.plot(epochs, history["train/loss"], label="Train")
+    loss_axis.plot(epochs, history["validation/loss"], label="Validation")
+    loss_axis.set_title("Loss by epoch")
+    loss_axis.set_xlabel("Epoch")
+    loss_axis.set_ylabel("Loss")
+    loss_axis.legend()
+    dti_axis.plot(epochs, history["validation/dti"], marker="o")
+    dti_axis.set_title("Validation DTI by epoch")
+    dti_axis.set_xlabel("Epoch")
+    dti_axis.set_ylabel("DTI")
+    dti_axis.set_ylim(0.0, 1.0)
+    canvas.print_figure(output_path, dpi=180, bbox_inches="tight")
+    figure.clear()
+    return output_path
 
 
 def save_prediction_heatmap(
@@ -165,6 +269,44 @@ def evaluate(
     }
 
 
+def evaluate_usgs_dti(
+    predictions: np.ndarray,
+    labels: np.ndarray,
+    valid_area: np.ndarray,
+    spatial_holdout_mask: np.ndarray | None = None,
+) -> dict[str, float | int]:
+    """Score the USGS map over all valid pixels, optionally within a holdout tile."""
+    if predictions.shape != labels.shape or valid_area.shape != labels.shape:
+        raise ValueError("predictions, labels, and valid_area must have one shape")
+    if spatial_holdout_mask is not None and spatial_holdout_mask.shape != labels.shape:
+        raise ValueError("spatial_holdout_mask must match label shape")
+
+    region = valid_area & np.isfinite(labels)
+    if not region.any():
+        raise ValueError("USGS DTI region contains no valid labels")
+    if not np.isfinite(predictions[region]).all():
+        raise FloatingPointError("predictions contain non-finite values in DTI region")
+    if not np.isin(labels[region], (0, 1)).all():
+        raise ValueError("USGS labels must be binary within the DTI region")
+
+    target = np.nan_to_num(labels, nan=0.0)
+    metrics: dict[str, float | int] = {
+        "usgs_full_map_dti": float(DTI(target, region)(predictions)),
+        "usgs_full_map_pixels": int(region.sum()),
+    }
+    if spatial_holdout_mask is not None:
+        holdout_region = region & spatial_holdout_mask
+        if not holdout_region.any():
+            raise ValueError("spatial holdout contains no valid USGS labels")
+        if not np.any((target == 1) & holdout_region):
+            raise ValueError("spatial holdout contains no mapped USGS faults")
+        metrics["spatial_holdout_dti"] = float(
+            DTI(target, holdout_region)(predictions)
+        )
+        metrics["spatial_holdout_pixels"] = int(holdout_region.sum())
+    return metrics
+
+
 def train_epoch(
     model: nn.Module,
     data_loader: Iterable[dict[str, torch.Tensor]],
@@ -207,14 +349,24 @@ def train(
     device: torch.device,
     checkpoint_dir: Path,
     save_every: int = 0,
+    patience: int | None = None,
 ) -> dict[str, Any]:
     """Fit a model, selecting and restoring the checkpoint with best val DTI."""
     if epochs < 1:
         raise ValueError("training.epochs must be positive")
+    if patience is not None and patience < 1:
+        raise ValueError("patience must be positive when configured")
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_dti = float("-inf")
     best_epoch = 0
+    epochs_without_improvement = 0
     best_path = checkpoint_dir / "best_checkpoint.pt"
+    history = {
+        "epoch": [],
+        "train/loss": [],
+        "validation/loss": [],
+        "validation/dti": [],
+    }
 
     for epoch in range(1, epochs + 1):
         training_loss = train_epoch(
@@ -231,10 +383,15 @@ def train(
             },
             step=epoch,
         )
+        history["epoch"].append(epoch)
+        history["train/loss"].append(training_loss)
+        history["validation/loss"].append(validation["loss"])
+        history["validation/dti"].append(validation["dti"])
 
         if validation["dti"] > best_dti:
             best_dti = validation["dti"]
             best_epoch = epoch
+            epochs_without_improvement = 0
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
@@ -244,6 +401,8 @@ def train(
                 best_path,
             )
             mlflow.log_artifact(str(best_path), artifact_path="checkpoints")
+        else:
+            epochs_without_improvement += 1
 
         if save_every > 0 and epoch % save_every == 0:
             periodic_path = checkpoint_dir / f"epoch_{epoch:04d}.pt"
@@ -253,12 +412,17 @@ def train(
             )
             mlflow.log_artifact(str(periodic_path), artifact_path="checkpoints")
 
+        if patience is not None and epochs_without_improvement >= patience:
+            break
+
     checkpoint = torch.load(best_path, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
     return {
         "best_dti": best_dti,
         "best_epoch": best_epoch,
         "checkpoint_path": best_path,
+        "epochs_run": len(history["epoch"]),
+        "history": history,
     }
 
 
@@ -306,11 +470,20 @@ def main(cfg: DictConfig) -> dict[str, Any]:
     features, labels, transform, raster_profile = _load_rasters(
         str(cfg.data.features_path), str(cfg.data.labels_path)
     )
+    spatial_holdout_mask = None
+    if bool(cfg.evaluation.spatial_holdout.enabled):
+        spatial_holdout_mask = create_spatial_holdout_mask(
+            labels.shape,
+            int(cfg.evaluation.spatial_holdout.grid_rows),
+            int(cfg.evaluation.spatial_holdout.grid_columns),
+            int(cfg.evaluation.spatial_holdout.region_index),
+        )
     dataset = instantiate(
         cfg.dataset,
         features=features,
         raw_labels=labels,
         transform=tuple(transform),
+        scaler_excluded_region_mask=spatial_holdout_mask,
     )
     split = SpatialFoldSplit(
         train_folds=tuple(int(fold) for fold in cfg.folds.train),
@@ -323,6 +496,7 @@ def main(cfg: DictConfig) -> dict[str, Any]:
         batch_size=int(cfg.training.batch_size),
         num_workers=int(cfg.training.num_workers),
         seed=seed,
+        excluded_region_mask=spatial_holdout_mask,
     )
     model = _instantiate_model(cfg.model).to(device)
     optimizer = instantiate(cfg.training.optimizer, params=model.parameters())
@@ -330,21 +504,39 @@ def main(cfg: DictConfig) -> dict[str, Any]:
 
     mlflow.set_tracking_uri(str(cfg.mlflow.tracking_uri))
     mlflow.set_experiment(str(cfg.mlflow.experiment_name))
-    with mlflow.start_run(run_name=str(cfg.mlflow.experiment_name)) as run:
+    run_name = _random_run_name()
+    with mlflow.start_run(run_name=run_name) as run:
         mlflow.log_text(OmegaConf.to_yaml(cfg), "config.yaml")
         mlflow.log_artifact(
             str(Path(getfile(type(model))).resolve()),
             artifact_path="model_source",
         )
+        mlflow.log_input(_make_mlflow_dataset(dataset, cfg), context="training")
         mlflow.log_params(
             {
                 "seed": seed,
+                "model.name": type(model).__name__,
                 "model.target": str(cfg.model._target_),
                 "training.epochs": int(cfg.training.epochs),
                 "training.batch_size": int(cfg.training.batch_size),
                 "training.optimizer": str(cfg.training.optimizer._target_),
+                "training.criterion.bce_weight": float(cfg.training.criterion.bce_weight),
+                "data.features_path": str(cfg.data.features_path),
+                "data.labels_path": str(cfg.data.labels_path),
+                "folds.train": ",".join(
+                    str(int(fold)) for fold in cfg.folds.train
+                ),
+                "folds.validation": int(cfg.folds.validation),
+                "folds.test": int(cfg.folds.test),
                 "dataset.patch_size": int(cfg.dataset.patch_size),
                 "dataset.kernel_size": int(cfg.dataset.kernel_size),
+                "evaluation.full_map_dti": bool(cfg.evaluation.full_map_dti),
+                "evaluation.spatial_holdout.enabled": bool(
+                    cfg.evaluation.spatial_holdout.enabled
+                ),
+                "evaluation.spatial_holdout.region_index": int(
+                    cfg.evaluation.spatial_holdout.region_index
+                ),
             }
         )
         checkpoint_dir = Path(
@@ -360,6 +552,14 @@ def main(cfg: DictConfig) -> dict[str, Any]:
             device=device,
             checkpoint_dir=checkpoint_dir,
             save_every=int(cfg.training.save_every),
+        )
+        training_curves_path = save_training_curves(
+            result["history"],
+            checkpoint_dir / "training_curves.png",
+        )
+        mlflow.log_artifact(
+            str(training_curves_path),
+            artifact_path="figures",
         )
         mlflow.log_metrics(
             {
@@ -377,8 +577,13 @@ def main(cfg: DictConfig) -> dict[str, Any]:
             }
         )
         result["test"] = test_metrics
+        result["training_curves_path"] = training_curves_path
 
-        if cfg.inference.enabled or cfg.inference.heatmap_enabled:
+        if (
+            cfg.inference.enabled
+            or cfg.inference.heatmap_enabled
+            or bool(cfg.evaluation.full_map_dti)
+        ):
             predictions = predict_full_map(
                 model,
                 dataset.features,
@@ -386,6 +591,28 @@ def main(cfg: DictConfig) -> dict[str, Any]:
                 device=device,
                 gaussian_sigma_scale=float(cfg.inference.gaussian_sigma_scale),
             )
+            valid_mask = None
+            if cfg.inference.enabled or bool(cfg.evaluation.full_map_dti):
+                valid_mask = load_submission_mask(
+                    to_absolute_path(str(cfg.inference.validity_mask_path)),
+                    raster_profile,
+                )
+            if bool(cfg.evaluation.full_map_dti):
+                if valid_mask is None:
+                    raise RuntimeError("full-map DTI requires a valid-area mask")
+                dti_metrics = evaluate_usgs_dti(
+                    predictions,
+                    labels,
+                    valid_mask,
+                    spatial_holdout_mask,
+                )
+                mlflow.log_metrics(
+                    {
+                        f"evaluation/{name}": float(value)
+                        for name, value in dti_metrics.items()
+                    }
+                )
+                result["evaluation"] = dti_metrics
             if cfg.inference.heatmap_enabled:
                 configured_heatmap_path = Path(
                     to_absolute_path(str(cfg.inference.heatmap_path))
@@ -400,12 +627,56 @@ def main(cfg: DictConfig) -> dict[str, Any]:
                 result["heatmap_path"] = heatmap_path
 
             if cfg.inference.enabled:
-                output_path = Path(
+                configured_output_path = Path(
                     to_absolute_path(str(cfg.inference.output_path))
                 )
-                save_probability_geotiff(predictions, raster_profile, output_path)
+                output_path = Path(
+                    configured_output_path.parent
+                    / run.info.run_id
+                    / configured_output_path.name
+                )
+                save_probability_geotiff(
+                    predictions,
+                    raster_profile,
+                    output_path,
+                    valid_mask,
+                )
                 mlflow.log_artifact(str(output_path), artifact_path="predictions")
                 result["prediction_path"] = output_path
+
+        model_name = type(model).__name__
+        model = model.cpu().eval()
+        model_input = torch.zeros(
+            (
+                2,
+                dataset.features.shape[0],
+                dataset.patch_size,
+                dataset.patch_size,
+            ),
+            dtype=torch.float32,
+            device="cpu",
+        )
+        model_signature = ModelSignature(
+            inputs=Schema([
+                TensorSpec(
+                    np.dtype(np.float32),
+                    (-1, dataset.features.shape[0], dataset.patch_size, dataset.patch_size),
+                )
+            ]),
+            outputs=Schema([
+                TensorSpec(
+                    np.dtype(np.float32),
+                    (-1, 1, dataset.patch_size, dataset.patch_size),
+                )
+            ]),
+        )
+        mlflow.pytorch.log_model(
+            model,
+            name=model_name,
+            step=int(result["best_epoch"]),
+            input_example=model_input,
+            signature=model_signature,
+        )
 
         return result
 

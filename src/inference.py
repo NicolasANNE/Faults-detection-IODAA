@@ -105,14 +105,44 @@ def predict_full_map(
     return probability_sum / weight_sum
 
 
+def load_submission_mask(
+    template_path: str | Path,
+    source_profile: Mapping[str, Any],
+) -> np.ndarray:
+    """Read the valid-area mask from a submission template on the source grid."""
+    with rasterio.open(template_path) as template:
+        if template.count != 1:
+            raise ValueError("submission template must contain exactly one band")
+        if (
+            (template.height, template.width)
+            != (source_profile["height"], source_profile["width"])
+            or template.crs != source_profile["crs"]
+            or template.transform != source_profile["transform"]
+        ):
+            raise ValueError("submission template must match the source raster grid")
+        sample = template.read(1, masked=True)
+    return ~np.ma.getmaskarray(sample) & np.isfinite(sample.data)
+
+
 def save_probability_geotiff(
     probabilities: np.ndarray,
     source_profile: Mapping[str, Any],
     output_path: str | Path,
+    valid_mask: np.ndarray | None = None,
 ) -> Path:
     """Write a one-band probability GeoTIFF using source georeferencing."""
     if probabilities.ndim != 2 or not np.isfinite(probabilities).all():
         raise ValueError("probabilities must be a finite two-dimensional map")
+    if probabilities.shape != (source_profile["height"], source_profile["width"]):
+        raise ValueError("probabilities must match the source raster dimensions")
+    if np.any((probabilities < 0) | (probabilities > 1)):
+        raise ValueError("probabilities must be between 0 and 1")
+    if valid_mask is not None and valid_mask.shape != probabilities.shape:
+        raise ValueError("valid_mask must match the probability map dimensions")
+
+    output = probabilities.astype(np.float32, copy=False)
+    if valid_mask is not None:
+        output = np.where(valid_mask, output, np.nan).astype(np.float32, copy=False)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     profile = dict(source_profile)
@@ -122,9 +152,9 @@ def save_probability_geotiff(
         width=probabilities.shape[1],
         count=1,
         dtype="float32",
-        nodata=None,
+        nodata=np.nan,
         compress="deflate",
     )
     with rasterio.open(output_path, "w", **profile) as destination:
-        destination.write(probabilities.astype(np.float32, copy=False), 1)
+        destination.write(output, 1)
     return output_path

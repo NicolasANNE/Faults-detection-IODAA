@@ -8,7 +8,7 @@ data:
   labels_path: data/raw/existing_faults.tif
 
 training:
-  epochs: 30
+  epochs: 100
   batch_size: 16
   num_workers: 0
   device: auto
@@ -22,13 +22,22 @@ training:
   criterion:
     _target_: src.metrics.MaskedBCEWithDTILoss
     bce_weight: 0.7
-    dti_weight: 0.3
+    dti_weight: null
     alpha: 0.2
     beta: 0.8
 
+evaluation:
+  full_map_dti: true
+  spatial_holdout:
+    enabled: true
+    grid_rows: 2
+    grid_columns: 2
+    region_index: 0
+
 inference:
-  enabled: false
+  enabled: true
   output_path: predictions/fault_probability.tif
+  validity_mask_path: data/raw/example_submission.tif
   heatmap_enabled: true
   heatmap_path: artifacts/fault_probability_heatmap.png
   gaussian_sigma_scale: 0.125
