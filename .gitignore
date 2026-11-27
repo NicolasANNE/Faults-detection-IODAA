@@ -4,6 +4,7 @@ src/
 src/*
 !src/data.py
 !src/metrics.py
+!src/optuna_tuning.py
 !src/reproducibility.py
 !src/torch_viz.py
 submissions/
@@ -13,6 +14,7 @@ Competition_*
 data/processed/
 data/raw/
 *.png
+!figures/*.png
 *.gif
 mlflow.db
 mlruns/
@@ -20,3 +22,9 @@ outputs/
 __pycache__/
 *.py[cod]
 !trainer.py
+checkpoints/
+multirun/
+predictions/\
+tests/
+*.db
+*.tif
