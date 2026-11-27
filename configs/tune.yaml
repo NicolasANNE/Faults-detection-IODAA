@@ -1,0 +1,19 @@
+defaults:
+  - train
+  - _self_
+
+tuning:
+  n_trials: 200
+  max_epochs: 400
+  patience: 10
+  study_name: fault-unet-validation-dti-v1
+  storage: sqlite:///optuna_studies.db
+  load_if_exists: true
+  search_space:
+    base_channels: [16, 24, 32]
+    dropout: [0.0, 0.5]
+    activation: [silu, gelu]
+    learning_rate: [0.00001, 0.003]
+    weight_decay: [0.0000001, 0.01]
+    batch_size: [8, 16]
+    bce_weight: [0.0, 1.0]
